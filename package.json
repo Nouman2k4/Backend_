@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node --max-old-space-size=2048 app.js", 
+    "dev": "nodemon --max-old-space-size=2048 app.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

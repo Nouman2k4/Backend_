@@ -19,12 +19,9 @@ const port = process.env.PORT || 4000; // Use environment variable for port
 
 // MongoDB connection
 const mongoURI = process.env.MONGODB_URI;
-mongoose.connect(mongoURI)
-    .then(() => {
-        console.log('MongoDB connected');
-        prefetchHostelData(); // Prefetch hostel data after MongoDB connection is established
-    })
-    .catch(err => console.error('MongoDB connection error:', err));
+mongoose.connect(mongoURI, { connectTimeoutMS: 30000 }) // 30 seconds timeout
+    .then(() => console.log('MongoDB connected'))
+    .catch(err => console.error('MongoDB connection error:', err.message));
 
 // Define the hostel schema
 const hostelSchema = new mongoose.Schema({
@@ -52,33 +49,50 @@ const hostelSchema = new mongoose.Schema({
 
 const Hostel = mongoose.model('Hostel', hostelSchema);
 
-// Cache to store hostel data
-let hostelCache = [];
+// Cache to store hostel data with a Map for fast lookups by name
+let hostelCache = new Map();
 
-// Function to prefetch hostel data
 async function prefetchHostelData() {
     try {
-        hostelCache = await Hostel.find(); // Fetch all hostels and store in cache
+        let page = 0;
+        let limit = 10;
+        let hostels;
+
+        hostelCache = new Map(); // Initialize the cache
+        hostelList = []; // Initialize the list to store all hostels
+
+        // Fetch hostels in batches of 10
+        do {
+            page += 1; // Increment page number for the next batch
+            hostels = await Hostel.find().skip((page - 1) * limit).limit(limit);
+
+            // If hostels were found, add them to the list and cache
+            if (hostels.length > 0) {
+                hostelList.push(...hostels); // Add new hostels to the list
+                hostels.forEach(hostel => {
+                    hostelCache.set(hostel.name, hostel); // Cache by name
+                });
+            }
+        } while (hostels.length === limit); // Continue until fewer than limit hostels are returned
+
         console.log('Hostel data pre-fetched and cached');
     } catch (error) {
         console.error('Error pre-fetching hostel data:', error);
     }
 }
 
+
+prefetchHostelData();
+
 // Route for the home page
 app.get('/', (req, res) => {
     res.send('Hello World');
 });
 
-// Route for about page
-app.get('/about', (req, res) => {
-    res.send('This is the About page');
-});
-
 // Route for fetching hostel info by name
 app.get('/hostel/:name', (req, res) => {
     const hostelName = req.params.name;
-    const hostel = hostelCache.find(h => h.name === hostelName);
+    const hostel = hostelCache.get(hostelName);
     if (hostel) {
         res.json(hostel);
     } else {
@@ -86,92 +100,72 @@ app.get('/hostel/:name', (req, res) => {
     }
 });
 
-// Route to get limited hostel data from cache
-app.get('/hostel-data', async (req, res) => {
+// Route to get limited hostel data from cache with pagination
+app.get('/hostel-data', (req, res) => {
     const page = parseInt(req.query.page) || 1; // Get the page number from query parameter
     const limit = parseInt(req.query.limit) || 5; // Get the limit from query parameter
     const skip = (page - 1) * limit; // Calculate the number of documents to skip
 
-    try {
-        const totalHostels = await Hostel.countDocuments(); // Get total count of hostels
-        const hostels = await Hostel.find().skip(skip).limit(limit); // Fetch limited hostels
+    const hostels = Array.from(hostelCache.values());
+    const totalHostels = hostels.length;
 
-        res.json({
-            totalPages: Math.ceil(totalHostels / limit),
-            currentPage: page,
-            hostels
-        });
-    } catch (error) {
-        console.error('Error fetching hostel data:', error);
-        res.status(500).json({ message: 'Error fetching hostel data', error });
-    }
+    // Slice the cached data to get the current page of hostels
+    const paginatedHostels = hostels.slice(skip, skip + limit);
+
+    res.json({
+        totalPages: Math.ceil(totalHostels / limit),
+        currentPage: page,
+        hostels: paginatedHostels
+    });
 });
 
 // Route to filter hostels by category and rating
-app.get('/hostels', async (req, res) => {
+app.get('/hostels', (req, res) => {
     const { category, rating } = req.query;
+    let filteredHostels = Array.from(hostelCache.values());
 
-    try {
-        let query = {};
-
-        if (category) {
-            query.category = category; // Use the provided category for filtering
-            console.log(`Filtering by category: ${category}`);
-        }
-
-        let sort = {};
-
-        if (rating) {
-            if (rating === "low-to-high") {
-                sort.rating = 1; // Ascending
-                console.log('Sorting by rating: low-to-high');
-            } else if (rating === "high-to-low") {
-                sort.rating = -1; // Descending
-                console.log('Sorting by rating: high-to-low');
-            } else {
-                const parsedRating = parseFloat(rating);
-                if (!isNaN(parsedRating)) {
-                    query.rating = { $gte: parsedRating }; // Filter ratings >= provided number
-                    console.log(`Filtering by rating: ${parsedRating}`);
-                } else {
-                    console.warn(`Invalid rating value provided: ${rating}`);
-                    return res.status(400).json({ message: 'Invalid rating value provided' });
-                }
-            }
-        }
-
-        console.log('Query:', query);
-        const filteredHostels = await Hostel.find(query).sort(sort);
-        console.log(`Found ${filteredHostels.length} hostels matching the query.`);
-        res.json(filteredHostels);
-    } catch (error) {
-        console.error('Error fetching filtered hostel data:', error);
-        res.status(500).json({ message: 'Error fetching filtered hostel data', error });
+    if (category) {
+        filteredHostels = filteredHostels.filter(h => h.category === category);
+        console.log(`Filtering by category: ${category}`);
     }
+
+    if (rating) {
+        const parsedRating = parseFloat(rating);
+        if (!isNaN(parsedRating)) {
+            filteredHostels = filteredHostels.filter(h => h.rating >= parsedRating);
+            console.log(`Filtering by rating: ${parsedRating}`);
+        } else {
+            return res.status(400).json({ message: 'Invalid rating value provided' });
+        }
+    }
+
+    console.log(`Found ${filteredHostels.length} hostels matching the query.`);
+    res.json(filteredHostels);
 });
 
 // Route for search requests
-app.post('/search', async (req, res) => {
+app.post('/search', (req, res) => {
     const { query } = req.body;
 
-    try {
-        const searchResults = await Hostel.find({
-            $or: [
-                { location: { $regex: query, $options: 'i' } },
-                { name: { $regex: query, $options: 'i' } }
-            ]
-        });
-        res.json(searchResults);
-    } catch (error) {
-        console.error('Error performing search:', error);
-        res.status(500).json({ message: 'Error performing search', error });
-    }
+    // Normalize the search query: lowercase and remove non-alphanumeric characters
+    const normalizedQuery = query.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    // Filter hostelCache based on normalized location or name
+    const searchResults = Array.from(hostelCache.values()).filter(h => {
+        const normalizedLocation = h.location.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const normalizedName = h.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+        return normalizedLocation.includes(normalizedQuery) || normalizedName.includes(normalizedQuery);
+    });
+
+    res.json(searchResults);
 });
+
 
 // Route to get a limited number of hostels from cache
 app.get('/hostel-limit', (req, res) => {
     const limit = parseInt(req.query.limit) || 5;
-    const limitedHostels = hostelCache.slice(0, limit);
+    const limitedHostels = Array.from(hostelCache.values()).slice(0, limit);
     res.json(limitedHostels);
 });
 
